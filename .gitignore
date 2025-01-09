@@ -1,0 +1,10 @@
+# Ignore .env file
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Debug db
+*.db
