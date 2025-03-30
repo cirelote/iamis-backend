@@ -8,3 +8,8 @@ __pycache__/
 
 # Debug db
 *.db
+*.db-shm
+*.db-wal
+
+# User specific
+layout.json

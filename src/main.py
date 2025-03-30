@@ -1,44 +1,54 @@
-from fastapi import FastAPI, Depends, HTTPException
+# main.py
+from datetime import datetime
+import os
+import json
+import threading
+from typing import Any, Dict, List
+
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from pydantic import BaseModel
-from datetime import datetime
-import os
-from dotenv import load_dotenv
-import threading
+from pydantic import BaseModel, ValidationError, Field
 import paho.mqtt.client as mqtt
-
-# Load environment variables
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./iamis-db.db")
-from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-from pydantic import BaseModel
-from datetime import datetime
-import os
+from sqlalchemy.ext.declarative import declarative_base
 from dotenv import load_dotenv
-import threading
-import paho.mqtt.client as mqtt
+import sqlite3
 
-# Load environment variables
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./iot_dashboard.db")
+
+if DATABASE_URL.startswith("sqlite:///"):
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        open(db_path, 'a').close()  # ensure the file exists
+
+    # Enable WAL mode:
+    try:
+        # open a direct connection using python's sqlite3 to enable WAL
+        with sqlite3.connect(db_path) as wal_conn:
+            wal_conn.execute("PRAGMA journal_mode=WAL;")
+            wal_conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception as e:
+        print("Could not enable WAL mode:", e)
+        
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "sensor/data")
 
+# Multi-origin:
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+
 # Database setup
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Define database models
+# --- Models -------------------------------------------------------------------
 class SensorData(Base):
     __tablename__ = "sensor_data"
 
@@ -48,10 +58,9 @@ class SensorData(Base):
     unit = Column(String, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-# Create database tables
 Base.metadata.create_all(bind=engine)
 
-# Pydantic models
+# --- Pydantic Schemas ---------------------------------------------------------
 class SensorDataCreate(BaseModel):
     sensor_type: str
     value: float
@@ -64,7 +73,7 @@ class SensorDataResponse(SensorDataCreate):
     class Config:
         from_attributes = True
 
-# Dependency to get DB session
+# --- Database Dependency ------------------------------------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -72,35 +81,104 @@ def get_db():
     finally:
         db.close()
 
-# Initialize FastAPI app
-app = FastAPI(title="IoT Dashboard Backend", version="1.0.0")
-
+# --- FastAPI App -------------------------------------------------------------
+app = FastAPI(title="IoT Dashboard Backend", version="1.0.1")
 
 app.add_middleware(
     CORSMiddleware,
-    # Frontend origin
-    allow_origins=os.getenv("FRONTEND_URL", "http://localhost:3000"),
+    allow_origins=[origin.strip() for origin in ALLOWED_ORIGINS],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --- MQTT Setup ---------------------------------------------------------------
+mqtt_client = mqtt.Client()
+mqtt_client_connected = False
 
-# Settings API
-class Settings(BaseModel):
-    temperatureThreshold: int
-    humidityThreshold: int
+def on_connect(client, userdata, flags, rc):
+    global mqtt_client_connected
+    mqtt_client_connected = (rc == 0)
+    print(f"Connected to MQTT broker with code {rc}")
+    client.subscribe(MQTT_TOPIC)
 
-@app.post("/api/settings")
-async def update_settings(settings: Settings):
+def on_message(client, userdata, msg):
+    print(f"Received message on topic {msg.topic}: {msg.payload.decode()}")
     try:
-        # Save settings to a database or a file
-        return {"message": "Settings updated successfully!"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to update settings.")
+        payload = json.loads(msg.payload.decode())
+        sensor_data = SensorDataCreate(**payload)
+        
+        # Use a separate short-lived session:
+        db = SessionLocal()  # no sharing with the main thread
+        db_sensor_data = SensorData(
+            sensor_type=sensor_data.sensor_type,
+            value=sensor_data.value,
+            unit=sensor_data.unit,
+        )
+        db.add(db_sensor_data)
+        db.commit()
+        db.close()
+    except (json.JSONDecodeError, ValidationError) as e:
+        print(f"Error processing message: {e}")
 
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
 
-# Sensor data API
+def start_mqtt():
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    mqtt_client.loop_forever()
+
+mqtt_thread = threading.Thread(target=start_mqtt, daemon=True)
+mqtt_thread.start()
+
+# --- Routes -------------------------------------------------------------------
+# Health-check: includes MQTT status
+@app.get("/health-check/")
+def health_check():
+    return {
+        "status": "Healthy",
+        "mqtt_connected": mqtt_client_connected
+    }
+
+# --- Layout -------------------------------------------------------------------
+LAYOUT_FILE_PATH = "layout.json"
+
+class TileLayout(BaseModel):
+    id: str
+    title: str
+    sensorType: str
+    layout: Dict[str, Any]  # {i, x, y, w, h, etc.}
+
+class DashboardLayout(BaseModel):
+    tiles: List[TileLayout]
+
+def load_layout_from_file():
+    if not os.path.exists(LAYOUT_FILE_PATH):
+        return {"tiles": []}
+    with open(LAYOUT_FILE_PATH, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+            return data
+        except json.JSONDecodeError:
+            return {"tiles": []}
+
+def save_layout_to_file(layout_data):
+    with open(LAYOUT_FILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(layout_data, f, indent=2)
+
+@app.get("/api/layout")
+def get_layout():
+    """ Return the saved dashboard layout from layout.json """
+    return load_layout_from_file()
+
+@app.post("/api/layout")
+def save_layout(layout: DashboardLayout):
+    """ Save the entire dashboard layout """
+    layout_dict = layout.dict()
+    save_layout_to_file(layout_dict)
+    return {"status": "ok", "savedTiles": len(layout_dict["tiles"])}
+
+# Sensor data
 @app.post("/sensor-data/", response_model=SensorDataResponse, status_code=201)
 def create_sensor_data(sensor_data: SensorDataCreate, db: Session = Depends(get_db)):
     db_sensor_data = SensorData(**sensor_data.dict())
@@ -110,57 +188,25 @@ def create_sensor_data(sensor_data: SensorDataCreate, db: Session = Depends(get_
     return db_sensor_data
 
 @app.get("/sensor-data/{sensor_type}/", response_model=list[SensorDataResponse])
-def get_sensor_data(sensor_type: str, db: Session = Depends(get_db)):
-    data = db.query(SensorData).filter(SensorData.sensor_type == sensor_type).all()
+def get_sensor_data(
+    sensor_type: str,
+    page: int = 1,
+    limit: int = 20,
+    db: Session = Depends(get_db)
+):
+    if page < 1 or limit < 1:
+        raise HTTPException(status_code=400, detail="Invalid pagination params.")
+    query = db.query(SensorData).filter(SensorData.sensor_type == sensor_type)
+    total = query.count()
+    data = query.order_by(SensorData.timestamp.desc()) \
+                .offset((page - 1) * limit) \
+                .limit(limit) \
+                .all()
     if not data:
-        raise HTTPException(status_code=404, detail="Sensor data not found")
+        return []
     return data
-
-@app.get("/health-check/", status_code=200)
-def health_check():
-    return {"status": "Healthy"}
 
 # Custom exception handler
 @app.exception_handler(HTTPException)
-def http_exception_handler(request, exc: HTTPException):
+def http_exception_handler(request: Request, exc: HTTPException):
     return {"detail": exc.detail, "status_code": exc.status_code}
-
-# MQTT client setup
-def on_connect(client, userdata, flags, rc):
-    print(f"Connected to MQTT broker with result code {rc}")
-    client.subscribe(MQTT_TOPIC)
-
-
-def on_message(client, userdata, msg):
-    print(f"Received message on topic {msg.topic}: {msg.payload.decode()}")
-    try:
-        # Parse the message
-        payload = eval(msg.payload.decode())  # Ensure the payload is sanitized in production
-        sensor_data = SensorDataCreate(**payload)
-
-        # Save to database
-        db = SessionLocal()
-        db_sensor_data = SensorData(**sensor_data.dict())
-        db.add(db_sensor_data)
-        db.commit()
-        db.close()
-    except Exception as e:
-        print(f"Error processing message: {e}")
-
-mqtt_client = mqtt.Client()
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
-
-# Start MQTT client in a separate thread
-def start_mqtt():
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    mqtt_client.loop_forever()
-
-mqtt_thread = threading.Thread(target=start_mqtt)
-mqtt_thread.daemon = True
-mqtt_thread.start()
-
-# Run FastAPI
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)

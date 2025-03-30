@@ -3,3 +3,5 @@ workers = 2  # Adjust based on your server's CPU cores
 worker_class = "uvicorn.workers.UvicornWorker"  # Use uvicorn worker for async support
 accesslog = "-"  # Log access to stdout
 errorlog = "-"  # Log errors to stdout
+
+# gunicorn src.main:app -c gunicorn_conf.py
